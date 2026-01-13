@@ -57,6 +57,10 @@ def parse_args():
     # Counting logic
     ap.add_argument("--side_margin_px", type=int, default=14, help="Band half-height used for counting decision")
     ap.add_argument("--warmup_sec", type=float, default=1.0, help="Disable counting for first N seconds")
+
+    ap.add_argument("--post_count_px", type=int, default=80,
+                    help="If track first appears below the counting band within this px, count as late-detected crossing")
+
     return ap.parse_args()
 
 
@@ -89,6 +93,8 @@ class Track:
 
     # new: count when first entering the counting band
     entered_band: bool
+
+    spawn_frame: int
 
 
 # -----------------------------
@@ -513,7 +519,8 @@ class CentroidTracker:
                     missed=0,
                     counted=t.counted,
                     lane_id=t.lane_id,
-                    entered_band=t.entered_band
+                    entered_band=t.entered_band,
+                    spawn_frame=t.spawn_frame
                 )
                 used_dets.add(best_j)
 
@@ -531,7 +538,8 @@ class CentroidTracker:
                 missed=0,
                 counted=False,
                 lane_id=None,
-                entered_band=False
+                entered_band=False,
+                spawn_frame=frame_idx,
             )
 
         # prune
@@ -546,23 +554,35 @@ class CentroidTracker:
 # Counting logic (FIX)
 # -----------------------------
 
-def update_counts_for_tracks(tracks: List[Track],
-                             lane_model: LaneAtLineModel,
-                             margin: int,
-                             counts: Dict[int, int],
-                             counting_enabled: bool):
+def update_counts_for_tracks(
+        tracks: List[Track],
+        lane_model: LaneAtLineModel,
+        margin: int,
+        counts: Dict[int, int],
+        counting_enabled: bool,
+        post_count_px: int,
+        frame_idx: int
+):
     """
-    Count when a track ENTERS the counting band for the first time.
-    Fixes missed counts when detection happens only after the vehicle already crossed.
+    Count in three cases:
+    A) Normal: first time the track ENTERS the main counting band (±margin).
+    B) Late detection: track first appears BELOW the band within post_count_px.
+    C) Early detection: track first appears ABOVE the band within post_count_px.
     """
+
     y_line = lane_model.line_y
+    y_band_top = y_line - margin
+    y_band_bot = y_line + margin
+
+    y_post_top = y_line - post_count_px
+    y_post_bot = y_line + post_count_px
 
     for i in range(len(tracks)):
         t = tracks[i]
         cx, cy = t.centroid
 
-        in_band = (y_line - margin) <= cy <= (y_line + margin)
-
+        # A) normal band entry
+        in_band = (y_band_top <= cy <= y_band_bot)
         if in_band and (not t.entered_band):
             t.entered_band = True
 
@@ -572,6 +592,27 @@ def update_counts_for_tracks(tracks: List[Track],
                 if lane_id is not None:
                     counts[lane_id] += 1
                     t.counted = True
+
+        # Only apply post-count logic at spawn frame
+        if counting_enabled and (not t.counted) and (t.spawn_frame == frame_idx):
+
+            # B) late detection (below)
+            if (cy > y_band_bot) and (cy <= y_post_bot):
+                lane_id = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
+                t.lane_id = lane_id
+                if lane_id is not None:
+                    counts[lane_id] += 1
+                    t.counted = True
+                    t.entered_band = True
+
+            # C) early detection (above)
+            elif (cy < y_band_top) and (cy >= y_post_top):
+                lane_id = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
+                t.lane_id = lane_id
+                if lane_id is not None:
+                    counts[lane_id] += 1
+                    t.counted = True
+                    t.entered_band = True
 
         tracks[i] = t
 
@@ -595,9 +636,43 @@ def overlay_lane_at_line(frame, lane_model: LaneAtLineModel):
     return out
 
 
-def overlay_lane_at_line_debug(frame, lane_model: LaneAtLineModel, roi_poly, band_half_h: int):
+def overlay_lane_at_line_debug(
+        frame,
+        lane_model: LaneAtLineModel,
+        roi_poly,
+        band_half_h: int,
+        count_margin: int,
+        post_count_px: int,
+        alpha: float = 0.25):
     out = frame.copy()
     h, w = out.shape[:2]
+
+    y_line = lane_model.line_y
+
+    # --- Main counting band (RED) ---
+    y1 = max(0, y_line - count_margin)
+    y2 = min(h - 1, y_line + count_margin)
+
+    overlay = out.copy()
+    cv2.rectangle(overlay, (0, y1), (w - 1, y2), (0, 0, 255), -1)
+    out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+
+    # --- Early post-count band (ORANGE, ABOVE) ---
+    y0 = max(0, y_line - post_count_px)
+    if y0 < y1:
+        overlay2 = out.copy()
+        cv2.rectangle(overlay2, (0, y0), (w - 1, y1), (0, 165, 255), -1)
+        out = cv2.addWeighted(overlay2, alpha * 0.9, out, 1 - alpha * 0.9, 0)
+
+    # --- Late post-count band (ORANGE, BELOW) ---
+    y3 = min(h - 1, y_line + post_count_px)
+    if y3 > y2:
+        overlay3 = out.copy()
+        cv2.rectangle(overlay3, (0, y2), (w - 1, y3), (0, 165, 255), -1)
+        out = cv2.addWeighted(overlay3, alpha * 0.9, out, 1 - alpha * 0.9, 0)
+
+    # Counting line
+    cv2.line(out, (0, y_line), (w - 1, y_line), (0, 0, 255), 2)
 
     # ROI (for debugging)
     cv2.polylines(out, [roi_poly], True, (0, 255, 255), 2)
@@ -735,9 +810,24 @@ def main():
         tracks = tracker.update(det_bboxes, frame_idx)
 
         counting_enabled = (frame_idx > warmup_frames)
-        update_counts_for_tracks(tracks, lane_model, args.side_margin_px, counts, counting_enabled)
+        update_counts_for_tracks(
+            tracks,
+            lane_model,
+            args.side_margin_px,
+            counts,
+            counting_enabled,
+            post_count_px=args.post_count_px,
+            frame_idx=frame_idx
+        )
 
-        vis = overlay_lane_at_line_debug(frame, lane_model, roi_poly, args.lane_band_h)
+        vis = overlay_lane_at_line_debug(
+            frame,
+            lane_model,
+            roi_poly,
+            args.lane_band_h,
+            count_margin=args.side_margin_px,
+            post_count_px=args.post_count_px,
+            alpha=0.22)
         # vis = overlay_lane_at_line(frame, lane_model)
         vis = overlay_tracks_and_counts(vis, tracks, counts)
 
