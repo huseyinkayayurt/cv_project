@@ -100,6 +100,56 @@ class Track:
 # -----------------------------
 # Helpers
 # -----------------------------
+def sec_to_mmss(sec: float) -> str:
+    sec = max(0.0, float(sec))
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m:02d}:{s:02d}"
+
+
+def draw_info_panel(frame, frame_idx: int, total_frames: int, fps: float,
+                    x: int = 20, y: int = 220, alpha: float = 0.55):
+    """
+    Draws a semi-transparent info panel with frame/time progress.
+    """
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    # safe values
+    if fps <= 1:
+        fps = 30.0
+    total_frames = int(total_frames) if total_frames and total_frames > 0 else 0
+
+    cur_sec = frame_idx / fps
+    total_sec = (total_frames / fps) if total_frames > 0 else 0.0
+
+    lines = [
+        f"Frame: {frame_idx} / {total_frames if total_frames > 0 else '?'}",
+        f"Time : {sec_to_mmss(cur_sec)} / {sec_to_mmss(total_sec) if total_frames > 0 else '??:??'}",
+        f"FPS  : {fps:.1f}",
+    ]
+
+    # panel geometry
+    pad = 10
+    line_h = 24
+    panel_w = 320
+    panel_h = pad * 2 + line_h * len(lines)
+
+    x2 = min(w - 1, x + panel_w)
+    y2 = min(h - 1, y + panel_h)
+
+    overlay = out.copy()
+    cv2.rectangle(overlay, (x, y), (x2, y2), (0, 0, 0), -1)
+    out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
+
+    ty = y + pad + line_h - 6
+    for s in lines:
+        cv2.putText(out, s, (x + pad, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        ty += line_h
+
+    return out
+
 
 def resize_frame(frame, scale):
     if abs(scale - 1.0) < 1e-6:
@@ -116,15 +166,25 @@ def apply_roi_mask(img, roi_poly):
     return cv2.bitwise_and(img, img, mask=mask)
 
 
-def default_road_roi(h, w):
-    # wide trapezoid: only used for motion mask cleanup
-    y_top = int(h * 0.28)
+def default_road_roi(h, w, top_pad=0.10, bottom_pad=0.01, y_top_ratio=0.28):
+    """
+    top_pad: top corners inset from left/right (smaller => wider at the top)
+    bottom_pad: bottom corners inset from left/right (smaller => wider at the bottom)
+    """
+    y_top = int(h * y_top_ratio)
     y_bottom = h - 1
+
+    left_bottom = int(w * bottom_pad)
+    right_bottom = int(w * (1.0 - bottom_pad))
+
+    left_top = int(w * top_pad)
+    right_top = int(w * (1.0 - top_pad))
+
     roi = np.array([
-        [int(w * 0.02), y_bottom],
-        [int(w * 0.30), y_top],
-        [int(w * 0.70), y_top],
-        [int(w * 0.98), y_bottom],
+        [left_bottom, y_bottom],
+        [left_top, y_top],
+        [right_top, y_top],
+        [right_bottom, y_bottom],
     ], dtype=np.int32)
     return roi
 
@@ -770,10 +830,13 @@ def main():
         raise RuntimeError("Cannot read first frame.")
     tmp = resize_frame(tmp, args.scale)
     H, W = tmp.shape[:2]
-    roi_poly = default_road_roi(H, W)
+    roi_poly = default_road_roi(H, W, top_pad=0.07, bottom_pad=0.001, y_top_ratio=0.28)
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        total_frames = 0
     if fps <= 1:
         fps = 30.0
     warmup_frames = int(args.warmup_sec * fps)
@@ -830,6 +893,8 @@ def main():
             alpha=0.22)
         # vis = overlay_lane_at_line(frame, lane_model)
         vis = overlay_tracks_and_counts(vis, tracks, counts)
+
+        vis = draw_info_panel(vis, frame_idx=frame_idx, total_frames=total_frames, fps=fps, x=W - 350, y=20, alpha=0.55)
 
         if args.show:
             cv2.imshow("Vehicle Counting (Lane@Line)", vis)
