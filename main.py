@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Highway vehicle counting (6 lanes) using classic image processing.
-
-Key design (your case):
-- Lane assignment is done ONLY at the counting line y = H*line_y_ratio, using a horizontal band histogram.
-- Counting is done when a track ENTERS the counting band for the first time (fixes late-detection after crossing).
-- Warmup window disables counting at the start so vehicles already on screen are not counted.
-
-Dependencies:
-  pip install opencv-python numpy
-
-Run:
-  python3 main.py --video input.mp4 --show 1
-Optional:
-  python3 main.py --video input.mp4 --save out.mp4
-"""
-
 import argparse
 import time
 from dataclasses import dataclass
@@ -26,10 +6,6 @@ from typing import List, Tuple, Optional, Dict
 import cv2
 import numpy as np
 
-
-# -----------------------------
-# CLI
-# -----------------------------
 
 def parse_args():
     ap = argparse.ArgumentParser()
@@ -49,30 +25,32 @@ def parse_args():
     ap.add_argument("--lane_peaks_min_dist", type=int, default=30, help="Min peak distance in pixels")
 
     # Detection / tracking
-    ap.add_argument("--min_area", type=int, default=450, help="Min contour area for vehicle candidate")
+    ap.add_argument("--min_area", type=int, default=600, help="Min contour area for vehicle candidate")
     ap.add_argument("--max_area", type=int, default=220000, help="Max contour area for vehicle candidate")
     ap.add_argument("--max_missed", type=int, default=12, help="Frames to keep a missing track alive")
-    ap.add_argument("--match_dist", type=int, default=70, help="Max centroid distance to match detections to tracks")
+    ap.add_argument("--match_dist", type=int, default=90, help="Max centroid distance to match detections to tracks")
 
     # Counting logic
     ap.add_argument("--side_margin_px", type=int, default=14, help="Band half-height used for counting decision")
     ap.add_argument("--warmup_sec", type=float, default=1.0, help="Disable counting for first N seconds")
 
     ap.add_argument("--post_count_px", type=int, default=80,
-                    help="If track first appears below the counting band within this px, count as late-detected crossing")
+                    help="If track first appears below the counting band within this px, count as late-detected "
+                         "crossing")
+    ap.add_argument("--post_count_px_above", type=int, default=140,
+                    help="Extra early-count band ABOVE the counting line (px)")
+    ap.add_argument("--post_min_age", type=int, default=5,
+                    help="Min track age (frames) before allowing post_count_above counting")
+    ap.add_argument("--post_min_up_px", type=float, default=2.0,
+                    help="Lane 1-3: require upward motion (prev_y - cur_y >= this) for post_count_above")
+    ap.add_argument("--lane_cooldown_frames", type=int, default=18,
+                    help="After counting a lane, ignore post_count_above counts in same lane for this many frames")
 
     return ap.parse_args()
 
 
-# -----------------------------
-# Data
-# -----------------------------
-
 @dataclass
 class LaneAtLineModel:
-    # 3 boundaries per side (outer boundaries are the frame borders)
-    # left_x  = [b1, b2, b3(inner near refuge)]
-    # right_x = [b4(inner near refuge), b5, b6]
     left_x: List[int]
     right_x: List[int]
     x_mid: int
@@ -87,19 +65,30 @@ class Track:
     bbox: Tuple[int, int, int, int]
     last_seen: int
     missed: int
-
     counted: bool
     lane_id: Optional[int]
-
-    # new: count when first entering the counting band
     entered_band: bool
-
     spawn_frame: int
+    prev_centroid: Tuple[int, int]
+    age: int
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def bbox_iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = aw * ah + bw * bh - inter
+    return float(inter) / float(union + 1e-9)
+
+
 def sec_to_mmss(sec: float) -> str:
     sec = max(0.0, float(sec))
     m = int(sec // 60)
@@ -109,9 +98,6 @@ def sec_to_mmss(sec: float) -> str:
 
 def draw_info_panel(frame, frame_idx: int, total_frames: int, fps: float,
                     x: int = 20, y: int = 220, alpha: float = 0.55):
-    """
-    Draws a semi-transparent info panel with frame/time progress.
-    """
     out = frame.copy()
     h, w = out.shape[:2]
 
@@ -167,10 +153,6 @@ def apply_roi_mask(img, roi_poly):
 
 
 def default_road_roi(h, w, top_pad=0.10, bottom_pad=0.01, y_top_ratio=0.28):
-    """
-    top_pad: top corners inset from left/right (smaller => wider at the top)
-    bottom_pad: bottom corners inset from left/right (smaller => wider at the bottom)
-    """
     y_top = int(h * y_top_ratio)
     y_bottom = h - 1
 
@@ -236,15 +218,7 @@ def pick_right3(peaks, x_min, x_max):
     return [p[0], p[-2], p[-1]]
 
 
-# -----------------------------
-# Lane@Line response
-# -----------------------------
-
 def lane_response_band(frame_bgr, y_line, band_half_h):
-    """
-    Build a robust lane marking response on a horizontal band around y_line.
-    Combines vertical edge energy with bright pixels (lane paint).
-    """
     h, w = frame_bgr.shape[:2]
     y1 = max(0, y_line - band_half_h)
     y2 = min(h - 1, y_line + band_half_h)
@@ -279,11 +253,6 @@ def estimate_lane_boundaries_at_line(
         min_dist,
         debug=1
 ):
-    """
-    Sample early frames and estimate lane boundary X positions at the counting line.
-    Uses 3-band stabilization per frame: y-d, y, y+d and takes median to reduce jitter.
-    """
-
     def _estimate_once_for_line(frame, y_line):
         H, W = frame.shape[:2]
         resp, _ = lane_response_band(frame, y_line, band_half_h)
@@ -424,9 +393,9 @@ def estimate_lane_boundaries_at_line(
         for x in right_med:
             cv2.line(vis, (x, 0), (x, H - 1), (255, 0, 0), 2)
 
-        cv2.imshow("Lane@Line Calibration", vis)
-        if dbg_resp_last is not None:
-            cv2.imshow("Lane@Line Response Band", dbg_resp_last)
+        # cv2.imshow("Lane@Line Calibration", vis)
+        # if dbg_resp_last is not None:
+        #     cv2.imshow("Lane@Line Response Band", dbg_resp_last)
 
         if dbg_hist_last is not None:
             hist = dbg_hist_last.astype(np.float32)
@@ -443,7 +412,7 @@ def estimate_lane_boundaries_at_line(
             for x in right_med:
                 cv2.line(plot, (x, 0), (x, plot_h - 1), (255, 0, 0), 1)
 
-            cv2.imshow("Lane@Line Histogram", plot)
+            # cv2.imshow("Lane@Line Histogram", plot)
 
         cv2.waitKey(1)
 
@@ -452,16 +421,6 @@ def estimate_lane_boundaries_at_line(
 
 
 def lane_id_at_crossing(cx: int, lane_model: LaneAtLineModel, width: int) -> Optional[int]:
-    """
-    left_x = [b1,b2,b3]
-      Lane1: [0, b1)
-      Lane2: [b1, b2)
-      Lane3: [b2, b3)
-    right_x = [b4,b5,b6]
-      Lane4: [b4, b5)
-      Lane5: [b5, b6)
-      Lane6: [b6, width)
-    """
     if cx < lane_model.x_mid:
         b1, b2, b3 = lane_model.left_x
         if cx < b1:
@@ -482,10 +441,6 @@ def lane_id_at_crossing(cx: int, lane_model: LaneAtLineModel, width: int) -> Opt
         return 6
 
 
-# -----------------------------
-# Vehicle detection
-# -----------------------------
-
 def build_bg_subtractor():
     return cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=32, detectShadows=False)
 
@@ -493,10 +448,6 @@ def build_bg_subtractor():
 def detect_vehicles(frame_bgr, roi_poly, subtractor,
                     min_area, max_area,
                     line_y: int, margin: int):
-    """
-    Returns list of bboxes (x,y,w,h) and fg mask.
-    Uses a dynamic min_area: smaller near the counting line.
-    """
     roi_frame = apply_roi_mask(frame_bgr, roi_poly)
     fg = subtractor.apply(roi_frame)
 
@@ -532,67 +483,157 @@ def detect_vehicles(frame_bgr, roi_poly, subtractor,
     return bboxes, fg
 
 
-# -----------------------------
-# Tracking
-# -----------------------------
-
 class CentroidTracker:
-    def __init__(self, max_missed=12, match_dist=70):
+    def __init__(self, max_missed=20, match_dist=90, revive_max_age=45, iou_match=0.15):
         self.max_missed = max_missed
         self.match_dist = match_dist
+        self.revive_max_age = revive_max_age
+        self.iou_match = iou_match
+
         self.next_id = 1
         self.tracks: Dict[int, Track] = {}
+
+        # NEW: recently lost tracks kept for ID resurrection
+        # tid -> Track snapshot
+        self.lost: Dict[int, Track] = {}
 
     @staticmethod
     def centroid_of(bbox):
         x, y, w, h = bbox
         return (x + w // 2, y + h // 2)
 
+    def _try_match_existing(self, t: Track, det_bbox, det_centroid):
+        """Return a score; higher is better."""
+        iou = bbox_iou(t.bbox, det_bbox)
+        d = np.hypot(det_centroid[0] - t.centroid[0], det_centroid[1] - t.centroid[1])
+
+        # strong preference for IoU
+        score = (2.5 * iou) - (d / (self.match_dist + 1e-6)) * 0.7
+        return score, iou, d
+
+    def _best_track_for_detection(self, candidates: List[Track], det_bbox, det_centroid):
+        best = None
+        best_score = -1e9
+        best_iou = 0.0
+        best_d = 1e9
+        for t in candidates:
+            score, iou, d = self._try_match_existing(t, det_bbox, det_centroid)
+            if score > best_score:
+                best_score, best, best_iou, best_d = score, t, iou, d
+        return best, best_score, best_iou, best_d
+
     def update(self, detections: List[Tuple[int, int, int, int]], frame_idx: int):
         det_centroids = [self.centroid_of(b) for b in detections]
 
-        # mark tracks missed
+        # 1) age/missed update for active tracks
         for tid in list(self.tracks.keys()):
             t = self.tracks[tid]
             t.missed += 1
             self.tracks[tid] = t
 
         used_dets = set()
-        for tid, t in list(self.tracks.items()):
-            best_j = None
-            best_d = 1e9
-            for j, c in enumerate(det_centroids):
-                if j in used_dets:
-                    continue
-                d = np.hypot(c[0] - t.centroid[0], c[1] - t.centroid[1])
-                if d < best_d:
-                    best_d = d
-                    best_j = j
+        used_tracks = set()
 
-            if best_j is not None and best_d <= self.match_dist:
-                bbox = detections[best_j]
+        # 2) Match detections to ACTIVE tracks (IoU-first)
+        active_list = list(self.tracks.values())
+
+        for j, (bbox, c) in enumerate(zip(detections, det_centroids)):
+            if not active_list:
+                break
+
+            best_t, best_score, best_iou, best_d = self._best_track_for_detection(active_list, bbox, c)
+            if best_t is None:
+                continue
+
+            # Accept match if IoU is decent OR distance is within threshold
+            if (best_iou >= self.iou_match) or (best_d <= self.match_dist):
+                tid = best_t.track_id
+                if tid in used_tracks:
+                    continue
+
+                old = self.tracks[tid]
                 self.tracks[tid] = Track(
                     track_id=tid,
-                    centroid=det_centroids[best_j],
+                    centroid=c,
+                    prev_centroid=old.centroid,
                     bbox=bbox,
                     last_seen=frame_idx,
                     missed=0,
-                    counted=t.counted,
-                    lane_id=t.lane_id,
-                    entered_band=t.entered_band,
-                    spawn_frame=t.spawn_frame
+                    counted=old.counted,
+                    lane_id=old.lane_id,
+                    entered_band=old.entered_band,
+                    spawn_frame=old.spawn_frame,
+                    age=old.age + 1
                 )
-                used_dets.add(best_j)
+                used_tracks.add(tid)
+                used_dets.add(j)
 
-        # new tracks
+        # 3) Resurrect from LOST pool BEFORE creating new IDs
+        #    For remaining detections, try to revive a lost track if overlap/near.
+        remaining = [j for j in range(len(detections)) if j not in used_dets]
+        if remaining and self.lost:
+            lost_list = list(self.lost.values())
+
+            for j in remaining:
+                bbox = detections[j]
+                c = det_centroids[j]
+
+                # filter: only lost tracks within revive window
+                viable = []
+                for lt in lost_list:
+                    if frame_idx - lt.last_seen <= self.revive_max_age:
+                        viable.append(lt)
+                if not viable:
+                    continue
+
+                best_lt, best_score, best_iou, best_d = self._best_track_for_detection(viable, bbox, c)
+                if best_lt is None:
+                    continue
+
+                if (best_iou >= self.iou_match) or (best_d <= self.match_dist * 0.9):
+                    tid = best_lt.track_id
+                    # revive into active tracks with SAME ID
+                    old = best_lt
+                    self.tracks[tid] = Track(
+                        track_id=tid,
+                        centroid=c,
+                        prev_centroid=old.centroid,
+                        bbox=bbox,
+                        last_seen=frame_idx,
+                        missed=0,
+                        counted=old.counted,
+                        lane_id=old.lane_id,
+                        entered_band=old.entered_band,
+                        spawn_frame=old.spawn_frame,
+                        age=old.age + 1
+                    )
+                    # remove from lost
+                    if tid in self.lost:
+                        del self.lost[tid]
+                    used_dets.add(j)
+
+        # 4) Create NEW tracks for still-unmatched detections
         for j, bbox in enumerate(detections):
             if j in used_dets:
                 continue
+
+            c = det_centroids[j]
+
+            # extra guard: if it overlaps ANY active track bbox (even if matching failed), don't new-ID it
+            overlapped = False
+            for t in self.tracks.values():
+                if bbox_iou(t.bbox, bbox) >= 0.10:
+                    overlapped = True
+                    break
+            if overlapped:
+                continue
+
             tid = self.next_id
             self.next_id += 1
             self.tracks[tid] = Track(
                 track_id=tid,
-                centroid=det_centroids[j],
+                centroid=c,
+                prev_centroid=c,
                 bbox=bbox,
                 last_seen=frame_idx,
                 missed=0,
@@ -600,19 +641,31 @@ class CentroidTracker:
                 lane_id=None,
                 entered_band=False,
                 spawn_frame=frame_idx,
+                age=1
             )
 
-        # prune
+        # 5) Move long-missed active tracks to LOST (instead of deleting immediately)
         for tid in list(self.tracks.keys()):
-            if self.tracks[tid].missed > self.max_missed:
+            t = self.tracks[tid]
+            if t.missed > self.max_missed:
+                # keep in lost pool for possible resurrection
+                self.lost[tid] = t
                 del self.tracks[tid]
+
+        # 6) Purge very old LOST tracks
+        for tid in list(self.lost.keys()):
+            if frame_idx - self.lost[tid].last_seen > self.revive_max_age:
+                del self.lost[tid]
 
         return list(self.tracks.values())
 
+    def drop_tracks_by_id(self, ids: List[int]):
+        for tid in ids:
+            if tid in self.tracks:
+                # move to lost so it won't get resurrected unless you want it to
+                self.lost[tid] = self.tracks[tid]
+                del self.tracks[tid]
 
-# -----------------------------
-# Counting logic (FIX)
-# -----------------------------
 
 def update_counts_for_tracks(
         tracks: List[Track],
@@ -620,66 +673,91 @@ def update_counts_for_tracks(
         margin: int,
         counts: Dict[int, int],
         counting_enabled: bool,
-        post_count_px: int,
-        frame_idx: int
+        post_count_px_above: int,
+        frame_idx: int,
+        counted_track_ids: set,
+        counted_track_lane: Dict[int, int],
+        lane_last_count_frame: Dict[int, int],
+        post_min_age: int,
+        post_min_up_px: float,
+        lane_cooldown_frames: int,
 ):
-    """
-    Count in three cases:
-    A) Normal: first time the track ENTERS the main counting band (±margin).
-    B) Late detection: track first appears BELOW the band within post_count_px.
-    C) Early detection: track first appears ABOVE the band within post_count_px.
-    """
-
     y_line = lane_model.line_y
     y_band_top = y_line - margin
     y_band_bot = y_line + margin
 
-    y_post_top = y_line - post_count_px
-    y_post_bot = y_line + post_count_px
+    y_post_top_above = y_line - post_count_px_above
 
     for i in range(len(tracks)):
         t = tracks[i]
         cx, cy = t.centroid
+        px, py = t.prev_centroid
 
-        # A) normal band entry
+        # HARD GUARD: same track_id can never be counted twice
+        if t.track_id in counted_track_ids:
+            if t.lane_id is None and t.track_id in counted_track_lane:
+                t.lane_id = counted_track_lane[t.track_id]
+            t.counted = True
+            tracks[i] = t
+            continue
+
+        # lane guess helper (we use cx for lane-id)
+        lane_guess = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
+        if lane_guess is not None:
+            t.lane_id = lane_guess
+
+        # A) Normal counting: first time ENTERS the main band
         in_band = (y_band_top <= cy <= y_band_bot)
         if in_band and (not t.entered_band):
             t.entered_band = True
 
             if counting_enabled and (not t.counted):
-                lane_id = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
-                t.lane_id = lane_id
-                if lane_id is not None:
-                    counts[lane_id] += 1
+                if lane_guess is not None:
+                    counts[lane_guess] += 1
                     t.counted = True
+                    counted_track_ids.add(t.track_id)
+                    counted_track_lane[t.track_id] = lane_guess
+                    lane_last_count_frame[lane_guess] = frame_idx
 
-        # Only apply post-count logic at spawn frame
+        # C) Early post-count ABOVE line (ONLY at spawn frame)
+        # IMPORTANT: apply strong filters for lanes 1-2-3 to prevent multi-count from track fragmentation
         if counting_enabled and (not t.counted) and (t.spawn_frame == frame_idx):
+            if (cy < y_band_top) and (cy >= y_post_top_above):
 
-            # B) late detection (below)
-            if (cy > y_band_bot) and (cy <= y_post_bot):
-                lane_id = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
-                t.lane_id = lane_id
-                if lane_id is not None:
-                    counts[lane_id] += 1
-                    t.counted = True
-                    t.entered_band = True
+                if lane_guess is None:
+                    tracks[i] = t
+                    continue
 
-            # C) early detection (above)
-            elif (cy < y_band_top) and (cy >= y_post_top):
-                lane_id = lane_id_at_crossing(cx, lane_model, lane_model.frame_w)
-                t.lane_id = lane_id
-                if lane_id is not None:
-                    counts[lane_id] += 1
-                    t.counted = True
-                    t.entered_band = True
+                # cooldown: prevent rapid re-count in same lane (fragmentation of same big vehicle)
+                if frame_idx - lane_last_count_frame[lane_guess] < lane_cooldown_frames:
+                    tracks[i] = t
+                    continue
+
+                # stability filter: ignore flicker tracks that live too short
+                if t.age < post_min_age:
+                    tracks[i] = t
+                    continue
+
+                # motion filter for lanes 1-2-3 (the problematic ones):
+                # they enter near the counting line and then move upward into the scene.
+                if lane_guess in (1, 2, 3):
+                    up_motion = (py - cy)  # positive if moving up
+                    if up_motion < post_min_up_px:
+                        tracks[i] = t
+                        continue
+
+                # If passed filters -> count once
+                counts[lane_guess] += 1
+                t.counted = True
+                t.entered_band = True
+
+                counted_track_ids.add(t.track_id)
+                counted_track_lane[t.track_id] = lane_guess
+                lane_last_count_frame[lane_guess] = frame_idx
 
         tracks[i] = t
 
 
-# -----------------------------
-# Overlay
-# -----------------------------
 def overlay_lane_at_line(frame, lane_model: LaneAtLineModel):
     out = frame.copy()
     h, w = out.shape[:2]
@@ -703,6 +781,7 @@ def overlay_lane_at_line_debug(
         band_half_h: int,
         count_margin: int,
         post_count_px: int,
+        post_count_px_above: int,
         alpha: float = 0.25):
     out = frame.copy()
     h, w = out.shape[:2]
@@ -718,18 +797,10 @@ def overlay_lane_at_line_debug(
     out = cv2.addWeighted(overlay, alpha, out, 1 - alpha, 0)
 
     # --- Early post-count band (ORANGE, ABOVE) ---
-    y0 = max(0, y_line - post_count_px)
-    if y0 < y1:
-        overlay2 = out.copy()
-        cv2.rectangle(overlay2, (0, y0), (w - 1, y1), (0, 165, 255), -1)
-        out = cv2.addWeighted(overlay2, alpha * 0.9, out, 1 - alpha * 0.9, 0)
-
-    # --- Late post-count band (ORANGE, BELOW) ---
-    y3 = min(h - 1, y_line + post_count_px)
-    if y3 > y2:
-        overlay3 = out.copy()
-        cv2.rectangle(overlay3, (0, y2), (w - 1, y3), (0, 165, 255), -1)
-        out = cv2.addWeighted(overlay3, alpha * 0.9, out, 1 - alpha * 0.9, 0)
+    y0 = max(0, y_line - post_count_px_above)
+    overlay2 = out.copy()
+    cv2.rectangle(overlay2, (0, y0), (w - 1, y1), (0, 165, 255), -1)
+    out = cv2.addWeighted(overlay2, alpha * 0.9, out, 1 - alpha * 0.9, 0)
 
     # Counting line
     cv2.line(out, (0, y_line), (w - 1, y_line), (0, 0, 255), 2)
@@ -770,7 +841,8 @@ def overlay_lane_at_line_debug(
 
     cv2.putText(out, "Lane 4", (mid(rx[0], rx[1]) - 25, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
     cv2.putText(out, "Lane 5", (mid(rx[1], rx[2]) - 25, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
-    cv2.putText(out, "Lane 6", (mid(rx[2], lane_model.frame_w - 1) - 25, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+    cv2.putText(out, "Lane 6", (mid(rx[2], lane_model.frame_w - 1) - 25, ytxt), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (255, 0, 0), 2)
 
     return out
 
@@ -791,17 +863,13 @@ def overlay_tracks_and_counts(frame, tracks: List[Track], counts: Dict[int, int]
         cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
         lane_txt = f"L{t.lane_id}" if t.lane_id is not None else "L?"
         cnt_txt = "C" if t.counted else ""
-        cv2.putText(out, f"ID{t.track_id} {lane_txt} {cnt_txt}",
+        cv2.putText(out, f"{lane_txt}",
                     (x, max(20, y - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.circle(out, (cx, cy), 3, (0, 255, 0), -1)
 
     return out
 
-
-# -----------------------------
-# Main
-# -----------------------------
 
 def main():
     args = parse_args()
@@ -851,12 +919,15 @@ def main():
     tracker = CentroidTracker(max_missed=args.max_missed, match_dist=args.match_dist)
     counts = {i: 0 for i in range(1, 7)}
 
+    lane_last_count_frame = {i: -10 ** 9 for i in range(1, 7)}
+
+    counted_track_ids = set()  # any lane: once counted, never count again
+    counted_track_lane: Dict[int, int] = {}  # track_id -> lane (for debug)
+
     t_start = time.time()
     frame_idx = 0
 
     while True:
-        # if time.time() - t_start > args.time_limit_sec:
-        #     break
 
         ok, frame = cap.read()
         if not ok:
@@ -879,19 +950,26 @@ def main():
             args.side_margin_px,
             counts,
             counting_enabled,
-            post_count_px=args.post_count_px,
-            frame_idx=frame_idx
+            post_count_px_above=args.post_count_px_above,
+            frame_idx=frame_idx,
+            counted_track_ids=counted_track_ids,
+            counted_track_lane=counted_track_lane,
+            lane_last_count_frame=lane_last_count_frame,
+            post_min_age=args.post_min_age,
+            post_min_up_px=args.post_min_up_px,
+            lane_cooldown_frames=args.lane_cooldown_frames,
         )
 
-        vis = overlay_lane_at_line_debug(
-            frame,
-            lane_model,
-            roi_poly,
-            args.lane_band_h,
-            count_margin=args.side_margin_px,
-            post_count_px=args.post_count_px,
-            alpha=0.22)
-        # vis = overlay_lane_at_line(frame, lane_model)
+        # vis = overlay_lane_at_line_debug(
+        #     frame,
+        #     lane_model,
+        #     roi_poly,
+        #     args.lane_band_h,
+        #     count_margin=args.side_margin_px,
+        #     post_count_px=args.post_count_px,
+        #     post_count_px_above=args.post_count_px_above,
+        #     alpha=0.22)
+        vis = overlay_lane_at_line(frame, lane_model)
         vis = overlay_tracks_and_counts(vis, tracks, counts)
 
         vis = draw_info_panel(vis, frame_idx=frame_idx, total_frames=total_frames, fps=fps, x=W - 350, y=20, alpha=0.55)
@@ -912,9 +990,12 @@ def main():
         writer.release()
     cv2.destroyAllWindows()
 
+    total = 0
     print("Final lane counts:")
     for i in range(1, 7):
         print(f"  Lane {i}: {counts[i]}")
+        total += counts[i]
+    print(f"Total: {total}")
 
 
 if __name__ == "__main__":
